@@ -161,12 +161,9 @@ class GUIInterface:
         """Run the processing with callbacks (internal method)."""
         try:
             self.processor = EmailProcessor(self.config_manager)
-            stats = self.processor.get_stats()
-            callback.on_start(stats)
 
-            total_candidates, total_moved = self.processor.run()
-
-            callback.on_complete(total_candidates, total_moved)
+            # Run the processor once with the callback
+            total_candidates, total_moved = self.processor.run(callback)
 
         except Exception as e:
             callback.on_error(str(e))

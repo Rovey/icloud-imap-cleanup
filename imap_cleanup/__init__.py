@@ -11,6 +11,7 @@ from .config import ConfigManager
 from .email_analyzer import EmailAnalyzer
 from .email_processor import EmailProcessor
 from .imap_manager import IMAPManager, IMAPConnectionPool
+from .gui_interface import GUIInterface, ProcessingCallback
 
 __all__ = [
     "ConfigManager",
@@ -18,4 +19,6 @@ __all__ = [
     "EmailProcessor",
     "IMAPManager",
     "IMAPConnectionPool",
+    "GUIInterface",
+    "ProcessingCallback",
 ]

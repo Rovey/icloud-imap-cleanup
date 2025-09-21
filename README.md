@@ -50,7 +50,11 @@ A professional, threaded email cleanup tool for iCloud IMAP with GUI support. Sa
 
 5. **Run the cleanup**
    ```bash
+   # Command line interface
    python imap_cleanup_cli.py
+
+   # Or launch the GUI
+   python imap_cleanup_gui.py
    ```
 
 ## 📋 Configuration
@@ -87,6 +91,24 @@ Key settings:
 ```
 
 ## 🛠️ Usage
+
+### Graphical User Interface
+
+```bash
+# Launch the GUI application
+python imap_cleanup_gui.py
+
+# Or using installed package
+pip install -e .
+imap-cleanup-gui
+```
+
+The GUI provides:
+- **Configuration Editor**: Edit all settings with a user-friendly interface
+- **Connection Testing**: Verify IMAP credentials before processing
+- **Real-time Progress**: Live progress bars and status updates
+- **Results Logging**: Detailed processing logs and results
+- **Safe Operation**: Built-in dry-run mode and confirmation dialogs
 
 ### Command Line Interface
 

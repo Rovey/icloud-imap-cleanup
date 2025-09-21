@@ -36,6 +36,7 @@ Issues = "https://github.com/username/imap-mail-cleanup/issues"
 
 [project.scripts]
 imap-cleanup = "imap_cleanup.cli:main"
+imap-cleanup-gui = "imap_cleanup.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["imap_cleanup*"]

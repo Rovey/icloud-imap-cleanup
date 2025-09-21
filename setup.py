@@ -35,6 +35,7 @@ setup(
     entry_points={
         "console_scripts": [
             "imap-cleanup=imap_cleanup.cli:main",
+            "imap-cleanup-gui=imap_cleanup.gui:main",
         ],
     },
     include_package_data=True,

@@ -7,6 +7,8 @@ Coordinates the 3-phase email processing pipeline with threading support.
 import imaplib
 import os
 import socket
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -126,12 +128,13 @@ class EmailProcessor:
 
         return list_unsub_query, subject_queries, domain_queries
 
-    def process_folder(self, folder: str, main_conn: imaplib.IMAP4_SSL) -> Tuple[int, int]:
+    def process_folder(self, folder: str, main_conn: imaplib.IMAP4_SSL, callback=None) -> Tuple[int, int]:
         """Process a single folder and return (candidates, moved) counts.
 
         Args:
             folder: Folder name to process
             main_conn: Main IMAP connection for searches
+            callback: Optional callback for progress updates
 
         Returns:
             Tuple of (total_candidates, total_moved)
@@ -161,10 +164,10 @@ class EmailProcessor:
         if not candidates:
             return 0, 0
 
-        return self._process_candidates(folder, candidates, set_a, set_b, set_c)
+        return self._process_candidates(folder, candidates, set_a, set_b, set_c, callback)
 
     def _process_candidates(self, folder: str, candidates: List[str],
-                          set_a: Set[str], set_b: Set[str], set_c: Set[str]) -> Tuple[int, int]:
+                          set_a: Set[str], set_b: Set[str], set_c: Set[str], callback=None) -> Tuple[int, int]:
         """Process candidate emails through the 3-phase pipeline.
 
         Args:
@@ -173,6 +176,7 @@ class EmailProcessor:
             set_a: UIDs matching List-Unsubscribe criteria
             set_b: UIDs matching subject keyword criteria
             set_c: UIDs matching delete domain criteria
+            callback: Optional callback for progress updates
 
         Returns:
             Tuple of (total_candidates, total_moved)
@@ -184,9 +188,13 @@ class EmailProcessor:
         if self.verbose:
             print(f"[i] Step 1: Fetching headers for {len(candidates)} emails using {self.header_fetch_workers} threads")
 
+        if callback:
+            callback.on_phase_start("Fetching email headers", len(candidates))
+
         header_batches = [candidates[i:i + self.batch_size]
                          for i in range(0, len(candidates), self.batch_size)]
         all_headers = {}
+        headers_processed = 0
 
         with ThreadPoolExecutor(max_workers=self.header_fetch_workers) as executor:
             header_futures = []
@@ -198,6 +206,10 @@ class EmailProcessor:
                 try:
                     batch_headers = future.result()
                     all_headers.update(batch_headers)
+                    headers_processed += len(batch_headers)
+
+                    if callback:
+                        callback.on_progress(headers_processed, len(candidates), f"Fetched headers")
                 except Exception as e:
                     if self.verbose:
                         print(f"[!] Header fetch error: {e}")
@@ -206,7 +218,11 @@ class EmailProcessor:
         if self.verbose:
             print(f"[i] Step 2: Processing decisions for {len(all_headers)} emails")
 
+        if callback:
+            callback.on_phase_start("Analyzing emails", len(all_headers))
+
         actions_to_execute = []
+        decisions_processed = 0
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             decision_futures = {}
@@ -221,13 +237,24 @@ class EmailProcessor:
                 uid = decision_futures[future]
                 try:
                     decision = future.result()
+                    decisions_processed += 1
+
                     if decision:
                         action, reason, addr, subject = decision
                         if action == "process":
                             actions_to_execute.append((uid, reason, addr, subject))
                             total_candidates += 1
-                        elif action == "skip" and self.verbose:
-                            print(f"  - SKIP ({reason}): {addr} | {subject}")
+                            if callback:
+                                callback.on_email_processed("candidate", uid, addr, subject, reason)
+                        elif action == "skip":
+                            if callback:
+                                callback.on_email_processed("skip", uid, addr, subject, reason)
+                            if self.verbose:
+                                print(f"  - SKIP ({reason}): {addr} | {subject}")
+
+                    if callback:
+                        callback.on_progress(decisions_processed, len(all_headers), f"Analyzed emails")
+
                 except Exception as e:
                     if self.verbose:
                         print(f"[!] Decision processing error for UID {uid}: {e}")
@@ -237,16 +264,20 @@ class EmailProcessor:
             if self.verbose:
                 print(f"[i] Step 3: Executing actions for {len(actions_to_execute)} emails using {self.max_workers} threads")
 
-            total_moved = self._execute_actions(folder, actions_to_execute)
+            if callback:
+                callback.on_phase_start("Moving emails", len(actions_to_execute))
+
+            total_moved = self._execute_actions(folder, actions_to_execute, callback)
 
         return total_candidates, total_moved
 
-    def _execute_actions(self, folder: str, actions: List[Tuple[str, str, str, str]]) -> int:
+    def _execute_actions(self, folder: str, actions: List[Tuple[str, str, str, str]], callback=None) -> int:
         """Execute email actions in parallel.
 
         Args:
             folder: Source folder name
             actions: List of (uid, reason, addr, subject) tuples to process
+            callback: Optional callback for progress updates
 
         Returns:
             Number of emails successfully moved
@@ -258,24 +289,64 @@ class EmailProcessor:
         action_batches = [actions[i:i + self.batch_size]
                          for i in range(0, len(actions), self.batch_size)]
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            action_futures = []
-            for batch in action_batches:
-                future = executor.submit(self._execute_action_batch, folder, batch, target_folder, dry_run)
-                action_futures.append(future)
+        # Shared progress tracking using mutable object
+        progress_lock = threading.Lock()
+        progress_data = {"processed": 0}
+        stop_progress_thread = threading.Event()
 
-            for future in as_completed(action_futures):
-                try:
-                    moved_count = future.result()
-                    total_moved += moved_count
-                except Exception as e:
-                    if self.verbose:
-                        print(f"[!] Action execution error: {e}")
+        def progress_monitor():
+            """Monitor and report progress every 0.5 seconds."""
+            last_reported = 0
+            while not stop_progress_thread.wait(0.5):
+                with progress_lock:
+                    current = progress_data["processed"]
+                if current != last_reported and callback:
+                    callback.on_progress(current, len(actions), f"Moved emails")
+                    last_reported = current
+                if current >= len(actions):
+                    break
+
+        # Start progress monitoring thread if we have a callback
+        progress_thread = None
+        if callback:
+            progress_thread = threading.Thread(target=progress_monitor, daemon=True)
+            progress_thread.start()
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                action_futures = []
+                for batch in action_batches:
+                    future = executor.submit(
+                        self._execute_action_batch,
+                        folder, batch, target_folder, dry_run,
+                        progress_lock, progress_data
+                    )
+                    action_futures.append(future)
+
+                for future in as_completed(action_futures):
+                    try:
+                        moved_count = future.result()
+                        total_moved += moved_count
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"[!] Action execution error: {e}")
+
+        finally:
+            # Stop progress monitoring
+            stop_progress_thread.set()
+            if progress_thread:
+                progress_thread.join(timeout=1.0)
+
+            # Final progress update
+            if callback:
+                with progress_lock:
+                    final_count = progress_data["processed"]
+                callback.on_progress(final_count, len(actions), f"Moved emails")
 
         return total_moved
 
     def _execute_action_batch(self, folder: str, actions: List[Tuple[str, str, str, str]],
-                             target_folder: str, dry_run: bool) -> int:
+                             target_folder: str, dry_run: bool, progress_lock=None, progress_data=None) -> int:
         """Execute a batch of actions.
 
         Args:
@@ -283,6 +354,8 @@ class EmailProcessor:
             actions: List of (uid, reason, addr, subject) tuples
             target_folder: Destination folder name
             dry_run: Whether to perform dry run only
+            progress_lock: Optional lock for progress updates
+            progress_data: Optional shared progress data dictionary
 
         Returns:
             Number of emails successfully moved
@@ -298,6 +371,7 @@ class EmailProcessor:
                 if dry_run:
                     if self.verbose:
                         print(f"  - DRY-RUN would move UID {uid} from {folder} → {target_folder} | {addr} | {match_reason} | {subject}")
+                    moved_count += 1  # Count dry run actions as processed
                 else:
                     try:
                         if self.imap_manager.move_email(conn, uid, target_folder):
@@ -311,13 +385,21 @@ class EmailProcessor:
                         if self.verbose:
                             print(f"  - Error moving UID {uid}: {e}")
 
+                # Update shared progress after each email
+                if progress_lock and progress_data:
+                    with progress_lock:
+                        progress_data["processed"] += 1
+
         finally:
             self.pool.return_connection(conn)
 
         return moved_count
 
-    def run(self) -> Tuple[int, int]:
+    def run(self, callback=None) -> Tuple[int, int]:
         """Run the complete email cleanup process.
+
+        Args:
+            callback: Optional callback object for progress updates
 
         Returns:
             Tuple of (total_candidates, total_moved)
@@ -325,6 +407,11 @@ class EmailProcessor:
         if self.verbose:
             cores = os.cpu_count() or 4
             print(f"[i] System cores: {cores}, Using {self.max_workers} processing workers + {self.header_fetch_workers} header fetch workers")
+
+        # Notify callback of start
+        if callback:
+            stats = self.get_stats()
+            callback.on_start(stats)
 
         # Create main connection
         main_conn = self.pool.get_connection()
@@ -345,11 +432,21 @@ class EmailProcessor:
             # Process all folders
             total_candidates = 0
             total_moved = 0
+            source_folders = self.config["mail_settings"]["source_folders"]
 
-            for folder in self.config["mail_settings"]["source_folders"]:
-                candidates, moved = self.process_folder(folder, main_conn)
+            for folder_index, folder in enumerate(source_folders, 1):
+                if callback:
+                    callback.on_folder_start(folder, len(source_folders), folder_index)
+
+                candidates, moved = self.process_folder(folder, main_conn, callback)
                 total_candidates += candidates
                 total_moved += moved
+
+                if callback:
+                    callback.on_folder_complete(folder, candidates, moved)
+
+            if callback:
+                callback.on_complete(total_candidates, total_moved)
 
             return total_candidates, total_moved
 
