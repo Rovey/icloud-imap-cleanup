@@ -21,9 +21,11 @@ import email
 import os
 import json
 import socket
+import threading
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables from .env file
 load_dotenv()
@@ -32,6 +34,15 @@ load_dotenv()
 _VERBOSE = True
 
 # =========================
+
+def get_optimal_workers(config_value, default_ratio=0.5, min_workers=1, max_workers=20):
+    """Calculate optimal number of workers based on CPU cores"""
+    if isinstance(config_value, int) and config_value > 0:
+        return min(max(config_value, min_workers), max_workers)
+
+    cpu_count = os.cpu_count() or 4  # Fallback to 4 if detection fails
+    optimal = max(int(cpu_count * default_ratio), min_workers)
+    return min(optimal, max_workers)
 
 def load_config():
     """Load configuration from config.json with fallback to defaults"""
@@ -47,7 +58,10 @@ def load_config():
             "dry_run": True,
             "verbose": True,
             "search_timeout": 30,
-            "max_search_keywords": 10
+            "max_search_keywords": 10,
+            "max_workers": "auto",
+            "batch_size": 50,
+            "header_fetch_workers": "auto"
         },
         "subject_keywords": [
             "unsubscribe", "newsletter", "nieuwsbrief", "promo", "promotion", "actie",
@@ -137,6 +151,42 @@ def connect(imap_host, imap_port, username, password):
     m.login(username, password)
     return m
 
+class IMAPConnectionPool:
+    def __init__(self, imap_host, imap_port, username, password, max_connections=5):
+        self.imap_host = imap_host
+        self.imap_port = imap_port
+        self.username = username
+        self.password = password
+        self.max_connections = max_connections
+        self._pool = []
+        self._lock = threading.Lock()
+
+    def get_connection(self):
+        with self._lock:
+            if self._pool:
+                return self._pool.pop()
+            else:
+                return connect(self.imap_host, self.imap_port, self.username, self.password)
+
+    def return_connection(self, conn):
+        with self._lock:
+            if len(self._pool) < self.max_connections:
+                self._pool.append(conn)
+            else:
+                try:
+                    conn.logout()
+                except:
+                    pass
+
+    def close_all(self):
+        with self._lock:
+            for conn in self._pool:
+                try:
+                    conn.logout()
+                except:
+                    pass
+            self._pool.clear()
+
 def ensure_folder(m, mailbox):
     typ, data = m.list()
     if typ != "OK":
@@ -203,6 +253,26 @@ def fetch_headers(m, uid, fields="(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])"):
     from_raw = msg.get("From", "")
     return from_raw, subj
 
+def fetch_headers_batch(pool, folder, uids):
+    """Fetch headers for multiple UIDs using a connection from the pool"""
+    conn = pool.get_connection()
+    results = {}
+
+    try:
+        conn.select(folder, readonly=True)
+        for uid in uids:
+            try:
+                from_raw, subject = fetch_headers(conn, uid)
+                results[uid] = (from_raw, subject)
+            except Exception as e:
+                if _VERBOSE:
+                    print(f"[!] Error fetching headers for UID {uid}: {e}")
+                results[uid] = (None, None)
+    finally:
+        pool.return_connection(conn)
+
+    return results
+
 def parse_from_address(from_header):
     # crude but good-enough extraction of the email address
     addr = email.utils.parseaddr(from_header)[1].lower()
@@ -221,6 +291,78 @@ def uid_move(m, uid, dest):
     m.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
     m.expunge()
     return True
+
+def process_email_decision(uid, from_raw, subject, wl, protect_keywords, subject_keywords,
+                          delete_domains, set_a, set_b, set_c):
+    """Make decision about an email without I/O operations"""
+    if from_raw is None:
+        return None
+
+    addr, domain = parse_from_address(from_raw)
+
+    # Whitelist check
+    if addr in wl or domain in wl:
+        return ("skip", "whitelist", addr, subject)
+
+    # Protect keywords (never move)
+    subj_l = (subject or "").lower()
+    if any(pk in subj_l for pk in protect_keywords):
+        return ("skip", "protected subject", addr, subject)
+
+    # Determine why this email was selected
+    match_reason = "unknown"
+    if uid in set_a:
+        match_reason = "List-Unsubscribe header"
+    elif uid in set_b:
+        # Find which keyword matched
+        for kw in subject_keywords:
+            if kw.lower() in subj_l:
+                match_reason = f"subject keyword '{kw}'"
+                break
+        if match_reason == "unknown":
+            match_reason = "subject keyword"
+    elif uid in set_c:
+        # Find which domain matched
+        for del_domain in delete_domains:
+            if domain == del_domain or addr.endswith(f"@{del_domain}"):
+                match_reason = f"delete domain '{del_domain}'"
+                break
+        if match_reason == "unknown":
+            match_reason = "delete domain"
+
+    return ("process", match_reason, addr, subject)
+
+def execute_email_actions(pool, folder, actions, target_folder, dry_run, verbose):
+    """Execute the actual email moves/deletions"""
+    results = []
+    if not actions:
+        return results
+
+    conn = pool.get_connection()
+    try:
+        if not dry_run:
+            conn.select(folder)  # Need write access for moves
+
+        for uid, match_reason, addr, subject in actions:
+            if dry_run:
+                results.append(f"  - DRY-RUN would move UID {uid} from {folder} → {target_folder} | {addr} | {match_reason} | {subject}")
+                results.append(("candidate", uid, addr, subject, match_reason))
+            else:
+                try:
+                    ok = uid_move(conn, uid, target_folder)
+                    if ok:
+                        results.append(("moved", uid, addr, subject, match_reason))
+                        if verbose:
+                            results.append(f"  - Moved UID {uid} to {target_folder} | {match_reason}")
+                    else:
+                        results.append(f"  - FAILED to move UID {uid}")
+                except Exception as e:
+                    results.append(f"  - Error moving UID {uid}: {e}")
+
+    finally:
+        pool.return_connection(conn)
+
+    return results
 
 def main():
     global _VERBOSE
@@ -242,6 +384,9 @@ def main():
     verbose = config["cleanup_settings"]["verbose"]
     search_timeout = config["cleanup_settings"].get("search_timeout", 30)
     max_search_keywords = config["cleanup_settings"].get("max_search_keywords", 10)
+    max_workers = get_optimal_workers(config["cleanup_settings"].get("max_workers", "auto"))
+    header_fetch_workers = get_optimal_workers(config["cleanup_settings"].get("header_fetch_workers", "auto"))
+    batch_size = config["cleanup_settings"].get("batch_size", 50)
     
     # Set socket timeout
     socket.setdefaulttimeout(search_timeout)
@@ -257,9 +402,15 @@ def main():
     if verbose:
         print(f"[i] Loaded {len(wl)} whitelist entries")
 
+    # Create connection pools for threading
+    pool = IMAPConnectionPool(imap_host, imap_port, username, password, max_workers + header_fetch_workers)
+
+    # Create main connection for searches and folder operations
     m = connect(imap_host, imap_port, username, password)
     if verbose:
-        print("[i] Logged in to iCloud IMAP")
+        cores = os.cpu_count() or 4
+        print(f"[i] Logged in to iCloud IMAP")
+        print(f"[i] System cores: {cores}, Using {max_workers} processing workers + {header_fetch_workers} header fetch workers")
 
     ensure_folder(m, target_folder)
 
@@ -306,60 +457,100 @@ def main():
         if verbose:
             print(f"[i] {folder}: {len(candidates)} candidate messages")
 
-        for uid in candidates:
-            from_raw, subject = fetch_headers(m, uid)
-            if from_raw is None:
-                continue
-            addr, domain = parse_from_address(from_raw)
+        if not candidates:
+            continue
 
-            # Whitelist check
-            if addr in wl or domain in wl:
-                if verbose:
-                    print(f"  - SKIP (whitelist): {addr} | {subject}")
-                continue
+        if verbose:
+            print(f"[i] Step 1: Fetching headers for {len(candidates)} emails using {header_fetch_workers} threads")
 
-            # Protect keywords (never move)
-            subj_l = (subject or "").lower()
-            if any(pk in subj_l for pk in protect_keywords):
-                if verbose:
-                    print(f"  - SKIP (protected subject): {subject}")
-                continue
+        # Step 1: Fetch all headers in parallel
+        header_batches = [candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)]
+        all_headers = {}
 
-            # Determine why this email was selected
-            match_reason = "unknown"
-            if uid in set_a:
-                match_reason = "List-Unsubscribe header"
-            elif uid in set_b:
-                # Find which keyword matched
-                for kw in subject_keywords:
-                    if kw.lower() in subj_l:
-                        match_reason = f"subject keyword '{kw}'"
-                        break
-                if match_reason == "unknown":
-                    match_reason = "subject keyword"
-            elif uid in set_c:
-                # Find which domain matched
-                for del_domain in delete_domains:
-                    if domain == del_domain or addr.endswith(f"@{del_domain}"):
-                        match_reason = f"delete domain '{del_domain}'"
-                        break
-                if match_reason == "unknown":
-                    match_reason = "delete domain"
+        with ThreadPoolExecutor(max_workers=header_fetch_workers) as executor:
+            header_futures = []
+            for batch in header_batches:
+                future = executor.submit(fetch_headers_batch, pool, folder, batch)
+                header_futures.append(future)
 
-            total_candidates += 1
-
-            if dry_run:
-                print(f"  - DRY-RUN would move UID {uid} from {folder} → {target_folder} | {addr} | {match_reason} | {subject}")
-            else:
-                # Need writeable select to move
-                m.select(folder)
-                ok = uid_move(m, uid, target_folder)
-                if ok:
-                    total_moved += 1
+            for future in as_completed(header_futures):
+                try:
+                    batch_headers = future.result()
+                    all_headers.update(batch_headers)
+                except Exception as e:
                     if verbose:
-                        print(f"  - Moved UID {uid} to {target_folder} | {match_reason}")
-                else:
-                    print(f"  - FAILED to move UID {uid}")
+                        print(f"[!] Header fetch error: {e}")
+
+        if verbose:
+            print(f"[i] Step 2: Processing decisions for {len(all_headers)} emails")
+
+        # Step 2: Process all decisions in parallel (CPU-bound, no I/O)
+        decisions = {}
+        actions_to_execute = []
+
+        # Process decisions in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            decision_futures = {}
+            for uid, (from_raw, subject) in all_headers.items():
+                future = executor.submit(
+                    process_email_decision,
+                    uid, from_raw, subject, wl, protect_keywords, subject_keywords,
+                    delete_domains, set_a, set_b, set_c
+                )
+                decision_futures[future] = uid
+
+            for future in as_completed(decision_futures):
+                uid = decision_futures[future]
+                try:
+                    decision = future.result()
+                    if decision:
+                        decisions[uid] = decision
+                        action, reason, addr, subject = decision
+                        if action == "process":
+                            actions_to_execute.append((uid, reason, addr, subject))
+                            total_candidates += 1
+                        elif action == "skip" and verbose:
+                            print(f"  - SKIP ({reason}): {addr} | {subject}")
+                except Exception as e:
+                    if verbose:
+                        print(f"[!] Decision processing error for UID {uid}: {e}")
+
+        if verbose and actions_to_execute:
+            print(f"[i] Step 3: Executing actions for {len(actions_to_execute)} emails using {max_workers} threads")
+
+        # Step 3: Execute actions in parallel
+        if actions_to_execute:
+            action_batches = [actions_to_execute[i:i + batch_size] for i in range(0, len(actions_to_execute), batch_size)]
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                action_futures = []
+                for batch in action_batches:
+                    future = executor.submit(
+                        execute_email_actions,
+                        pool, folder, batch, target_folder, dry_run, verbose
+                    )
+                    action_futures.append(future)
+
+                for future in as_completed(action_futures):
+                    try:
+                        batch_results = future.result()
+                        for result in batch_results:
+                            if isinstance(result, tuple):
+                                action, uid, addr, subject, match_reason = result
+                                if action == "moved":
+                                    total_moved += 1
+                            elif isinstance(result, str) and verbose:
+                                print(result)
+                    except Exception as e:
+                        if verbose:
+                            print(f"[!] Action execution error: {e}")
+
+    # Cleanup connections
+    try:
+        m.logout()
+    except:
+        pass
+    pool.close_all()
 
     print(f"[done] Candidates considered: {total_candidates}")
     if not dry_run:
