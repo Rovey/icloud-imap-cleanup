@@ -117,6 +117,16 @@ Keywords that prevent emails from being moved (for important financial documents
 }
 ```
 
+#### 6. Delete Domains
+Automatically move emails from specific domains (useful for promotional/automated emails):
+```json
+"delete_domains": [
+    "mail.degiro.com",
+    "noreply.example.com",
+    "updates.company.com"
+]
+```
+
 ### Customization Examples
 
 #### Conservative Settings (1 year, dry run enabled)
@@ -152,12 +162,26 @@ Keywords that prevent emails from being moved (for important financial documents
 }
 ```
 
+#### Delete Specific Domains
+```json
+{
+    "delete_domains": [
+        "mail.degiro.com",
+        "noreply.booking.com",
+        "updates.linkedin.com",
+        "notifications.paypal.com"
+    ]
+}
+```
+
 ## How It Works
 
 1. **Connects** to iCloud IMAP using your credentials
 2. **Scans** specified folders for emails older than the age threshold
 3. **Identifies** promotional emails using:
    - List-Unsubscribe header presence
+   - Subject line keywords
+   - Specific sender domains
    - Subject line keywords
 4. **Filters** out whitelisted senders and protected keywords
 5. **Moves** matching emails to the review folder (or shows what would be moved in dry-run mode)
@@ -174,13 +198,14 @@ Keywords that prevent emails from being moved (for important financial documents
 ## Customization Tips
 
 1. **Add New Subject Keywords**: Include terms specific to your language/region
-2. **Adjust Age Threshold**: 
+2. **Add Delete Domains**: Specify domains that send unwanted emails (e.g., `"mail.degiro.com"`)
+3. **Adjust Age Threshold**: 
    - 180 days for aggressive cleanup
    - 365 days for balanced approach
    - 730 days for conservative cleanup
-3. **Enable/Disable Dry Run**: Always test with `"dry_run": true` first
-4. **Add Source Folders**: Include other folders like "Sent", "Spam"
-5. **Customize Target Folder**: Choose your preferred destination
+4. **Enable/Disable Dry Run**: Always test with `"dry_run": true` first
+5. **Add Source Folders**: Include other folders like "Sent", "Spam"
+6. **Customize Target Folder**: Choose your preferred destination
 
 ## Important Notes
 

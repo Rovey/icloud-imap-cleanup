@@ -65,7 +65,10 @@ def load_config():
         "whitelist_settings": {
             "whitelist_file": "whitelist.txt",
             "additional_whitelist": []
-        }
+        },
+        "delete_domains": [
+            # Example: "mail.degiro.com", "noreply.example.com"
+        ]
     }
     
     try:
@@ -200,6 +203,7 @@ def main():
     
     subject_keywords = config["subject_keywords"]
     protect_keywords = config["protect_keywords"]
+    delete_domains = config.get("delete_domains", [])
     
     wl = load_whitelist(config)
     if verbose:
@@ -220,6 +224,8 @@ def main():
     q_list_unsub = f'NOT FLAGGED BEFORE {before} HEADER List-Unsubscribe ""'
     # B) Subject contains any keyword (we'll OR by running separate searches and union)
     subject_queries = [f'NOT FLAGGED BEFORE {before} SUBJECT "{kw}"' for kw in subject_keywords]
+    # C) Domain-based deletion queries (from specific domains)
+    domain_queries = [f'NOT FLAGGED BEFORE {before} FROM "{domain}"' for domain in delete_domains]
 
     total_candidates = 0
     total_moved = 0
@@ -233,7 +239,8 @@ def main():
 
         set_a = search_uids(m, folder, q_list_unsub)
         set_b = union_searches(m, folder, subject_queries)
-        candidates = list(set_a | set_b)
+        set_c = union_searches(m, folder, domain_queries)
+        candidates = list(set_a | set_b | set_c)
 
         if verbose:
             print(f"[i] {folder}: {len(candidates)} candidate messages")
@@ -257,10 +264,31 @@ def main():
                     print(f"  - SKIP (protected subject): {subject}")
                 continue
 
+            # Determine why this email was selected
+            match_reason = "unknown"
+            if uid in set_a:
+                match_reason = "List-Unsubscribe header"
+            elif uid in set_b:
+                # Find which keyword matched
+                for kw in subject_keywords:
+                    if kw.lower() in subj_l:
+                        match_reason = f"subject keyword '{kw}'"
+                        break
+                if match_reason == "unknown":
+                    match_reason = "subject keyword"
+            elif uid in set_c:
+                # Find which domain matched
+                for del_domain in delete_domains:
+                    if domain == del_domain or addr.endswith(f"@{del_domain}"):
+                        match_reason = f"delete domain '{del_domain}'"
+                        break
+                if match_reason == "unknown":
+                    match_reason = "delete domain"
+
             total_candidates += 1
 
             if dry_run:
-                print(f"  - DRY-RUN would move UID {uid} from {folder} → {target_folder} | {addr} | {subject}")
+                print(f"  - DRY-RUN would move UID {uid} from {folder} → {target_folder} | {addr} | {match_reason} | {subject}")
             else:
                 # Need writeable select to move
                 m.select(folder)
@@ -268,7 +296,7 @@ def main():
                 if ok:
                     total_moved += 1
                     if verbose:
-                        print(f"  - Moved UID {uid} to {target_folder}")
+                        print(f"  - Moved UID {uid} to {target_folder} | {match_reason}")
                 else:
                     print(f"  - FAILED to move UID {uid}")
 

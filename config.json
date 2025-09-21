@@ -46,7 +46,8 @@
     "shipment",
     "delivery",
     "processing",
-    "Wat vond u"
+    "Wat vond u",
+    "verzendbericht"
   ],
   "protect_keywords": [
     "factuur",
@@ -73,5 +74,9 @@
   "whitelist_settings": {
     "whitelist_file": "whitelist.txt",
     "additional_whitelist": []
-  }
+  },
+  "delete_domains": [
+    "mail.degiro.com",
+    "noreply.example.com"
+  ]
 }
