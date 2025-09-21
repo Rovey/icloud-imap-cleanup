@@ -1,0 +1,4 @@
+# Put emails or domains (one per line) that must never be auto-moved.
+# Examples:
+# supplier@example.com
+# trustedpartner.com
