@@ -1,0 +1,65 @@
+{
+  "_comment": "This is your personal configuration that won't be tracked by Git",
+  "_comment2": "Copy this to config.local.json and customize as needed",
+  "_comment3": "Only include settings you want to override from config.json",
+  
+  "cleanup_settings": {
+    "age_days": 180,
+    "dry_run": false,
+    "verbose": true
+  },
+  
+  "subject_keywords": [
+    "unsubscribe",
+    "newsletter",
+    "nieuwsbrief",
+    "promo",
+    "promotion",
+    "actie",
+    "deal",
+    "korting",
+    "sale",
+    "update",
+    "digest",
+    "marketing",
+    "leveringsupdate",
+    "tracking",
+    "pakket",
+    "afgeleverd",
+    "bezorgd",
+    "shipping",
+    "delivered",
+    "transactiebevestiging",
+    "bevestiging",
+    "reactie",
+    "kopie",
+    "bestelling",
+    "order",
+    "verzending",
+    "bezorging",
+    "behandeling",
+    "bedankt",
+    "thank",
+    "confirmation",
+    "confirmed",
+    "shipment",
+    "delivery",
+    "processing",
+    "Wat vond u",
+    "verzendbericht"
+  ],
+  
+  "delete_domains": [
+    "mail.degiro.com",
+    "noreply.booking.com",
+    "updates.linkedin.com",
+    "notifications.paypal.com"
+  ],
+  
+  "whitelist_settings": {
+    "additional_whitelist": [
+      "important@company.com",
+      "trusted.domain.com"
+    ]
+  }
+}

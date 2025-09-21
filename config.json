@@ -1,4 +1,5 @@
 {
+  "_comment": "Default configuration - customize with config.local.json for personal settings",
   "mail_settings": {
     "imap_host": "imap.mail.me.com",
     "imap_port": 993,
@@ -7,47 +8,29 @@
   },
   "cleanup_settings": {
     "age_days": 365,
-    "dry_run": false,
-    "verbose": true
+    "dry_run": true,
+    "verbose": true,
+    "search_timeout": 30,
+    "max_search_keywords": 10
   },
   "subject_keywords": [
     "unsubscribe",
     "newsletter",
-    "nieuwsbrief",
     "promo",
     "promotion",
-    "actie",
     "deal",
-    "korting",
     "sale",
     "update",
     "digest",
     "marketing",
-    "leveringsupdate",
     "tracking",
-    "pakket",
-    "afgeleverd",
-    "bezorgd",
     "shipping",
     "delivered",
-    "transactiebevestiging",
-    "bevestiging",
-    "reactie",
-    "kopie",
-    "bestelling",
-    "order",
-    "verzending",
-    "bezorging",
-    "behandeling",
-    "bedankt",
-    "thank",
     "confirmation",
     "confirmed",
     "shipment",
     "delivery",
-    "processing",
-    "Wat vond u",
-    "verzendbericht"
+    "processing"
   ],
   "protect_keywords": [
     "factuur",
@@ -75,8 +58,5 @@
     "whitelist_file": "whitelist.txt",
     "additional_whitelist": []
   },
-  "delete_domains": [
-    "mail.degiro.com",
-    "noreply.example.com"
-  ]
+  "delete_domains": []
 }

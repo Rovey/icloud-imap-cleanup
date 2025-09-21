@@ -20,6 +20,7 @@ import imaplib
 import email
 import os
 import json
+import socket
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from dotenv import load_dotenv
@@ -43,8 +44,10 @@ def load_config():
         },
         "cleanup_settings": {
             "age_days": 365,
-            "dry_run": False,
-            "verbose": True
+            "dry_run": True,
+            "verbose": True,
+            "search_timeout": 30,
+            "max_search_keywords": 10
         },
         "subject_keywords": [
             "unsubscribe", "newsletter", "nieuwsbrief", "promo", "promotion", "actie",
@@ -84,6 +87,26 @@ def load_config():
                     if key not in config[section]:
                         config[section][key] = default_value
         
+        # Load local config overrides if they exist
+        try:
+            with open("config.local.json", "r", encoding="utf-8") as f:
+                local_config = json.load(f)
+            
+            # Merge local config overrides
+            for section, values in local_config.items():
+                if section not in config:
+                    config[section] = values
+                elif isinstance(values, dict) and isinstance(config[section], dict):
+                    config[section].update(values)
+                else:
+                    config[section] = values
+            
+            print("[i] Loaded local configuration overrides from config.local.json")
+        except FileNotFoundError:
+            pass  # No local config file, that's fine
+        except json.JSONDecodeError as e:
+            print(f"[!] Error parsing config.local.json: {e}, ignoring local config")
+        
         return config
     except FileNotFoundError:
         print("[!] config.json not found, using default configuration")
@@ -108,6 +131,8 @@ def load_whitelist(config):
     return items
 
 def connect(imap_host, imap_port, username, password):
+    # Set socket timeout to prevent hanging
+    socket.setdefaulttimeout(30)
     m = imaplib.IMAP4_SSL(imap_host, imap_port)
     m.login(username, password)
     return m
@@ -124,29 +149,47 @@ def imap_date_before(days):
     dt = datetime.now(timezone.utc) - timedelta(days=days)
     return dt.strftime("%d-%b-%Y")  # e.g., 17-Sep-2025
 
-def search_uids(m, folder, query_parts):
+def search_uids(m, folder, query_parts, max_retries=2):
     m.select(folder, readonly=True)
-    try:
-        # Try the search with proper IMAP syntax
-        if isinstance(query_parts, list):
-            # Convert list to proper IMAP search string
-            query_string = " ".join(str(part) for part in query_parts)
-        else:
-            query_string = query_parts
-        
-        typ, data = m.uid("SEARCH", None, query_string)
-        if typ != "OK" or not data or data[0] is None:
+    
+    for attempt in range(max_retries + 1):
+        try:
+            # Try the search with proper IMAP syntax
+            if isinstance(query_parts, list):
+                # Convert list to proper IMAP search string
+                query_string = " ".join(str(part) for part in query_parts)
+            else:
+                query_string = query_parts
+            
+            if _VERBOSE and attempt > 0:
+                print(f"[i] Retrying search (attempt {attempt + 1})")
+            
+            typ, data = m.uid("SEARCH", None, query_string)
+            if typ != "OK" or not data or data[0] is None:
+                return set()
+            uids = set(data[0].decode().split())
+            return uids
+            
+        except (socket.timeout, socket.error) as e:
+            if _VERBOSE:
+                print(f"[!] Network timeout/error on search attempt {attempt + 1}: {e}")
+            if attempt < max_retries:
+                continue
+            else:
+                print(f"[!] Search failed after {max_retries + 1} attempts, skipping")
+                return set()
+        except Exception as e:
+            if _VERBOSE:
+                print(f"[!] Search error: {e}")
             return set()
-        uids = set(data[0].decode().split())
-        return uids
-    except Exception as e:
-        if _VERBOSE:
-            print(f"[!] Search error: {e}")
-        return set()
+    
+    return set()
 
 def union_searches(m, folder, queries):
     u = set()
-    for q in queries:
+    for i, q in enumerate(queries):
+        if _VERBOSE and len(queries) > 5:
+            print(f"[i] Processing search query {i + 1}/{len(queries)}")
         u |= search_uids(m, folder, q)
     return u
 
@@ -197,6 +240,11 @@ def main():
     age_days = config["cleanup_settings"]["age_days"]
     dry_run = config["cleanup_settings"]["dry_run"]
     verbose = config["cleanup_settings"]["verbose"]
+    search_timeout = config["cleanup_settings"].get("search_timeout", 30)
+    max_search_keywords = config["cleanup_settings"].get("max_search_keywords", 10)
+    
+    # Set socket timeout
+    socket.setdefaulttimeout(search_timeout)
     
     # Set global verbose flag
     _VERBOSE = verbose
@@ -222,8 +270,21 @@ def main():
     # Build searches:
     # A) Messages with List-Unsubscribe header (unflagged and older than age_days)
     q_list_unsub = f'NOT FLAGGED BEFORE {before} HEADER List-Unsubscribe ""'
-    # B) Subject contains any keyword (we'll OR by running separate searches and union)
-    subject_queries = [f'NOT FLAGGED BEFORE {before} SUBJECT "{kw}"' for kw in subject_keywords]
+    
+    # B) Subject contains any keyword (batch them to avoid too many searches)
+    if len(subject_keywords) > max_search_keywords:
+        if verbose:
+            print(f"[i] Batching {len(subject_keywords)} keywords into groups of {max_search_keywords}")
+        subject_batches = [subject_keywords[i:i + max_search_keywords] 
+                          for i in range(0, len(subject_keywords), max_search_keywords)]
+        subject_queries = []
+        for batch in subject_batches:
+            # Create OR query for batch
+            or_terms = " OR ".join([f'SUBJECT "{kw}"' for kw in batch])
+            subject_queries.append(f'NOT FLAGGED BEFORE {before} ({or_terms})')
+    else:
+        subject_queries = [f'NOT FLAGGED BEFORE {before} SUBJECT "{kw}"' for kw in subject_keywords]
+    
     # C) Domain-based deletion queries (from specific domains)
     domain_queries = [f'NOT FLAGGED BEFORE {before} FROM "{domain}"' for domain in delete_domains]
 

@@ -144,6 +144,11 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local configuration overrides (not tracked by git)
+config.local.json
+# Keep the example file in version control
+!config.local.example.json
+
 # Spyder project settings
 .spyderproject
 .spyproject

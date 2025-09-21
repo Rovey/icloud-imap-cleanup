@@ -53,6 +53,8 @@ A safe and intelligent email cleanup tool for iCloud that automatically moves pr
 
 - `icloud_imap_cleanup.py` - Main script
 - `config.json` - Configuration file (auto-created with defaults)
+- `config.local.json` - Personal config overrides (not tracked by Git)
+- `config.local.example.json` - Template for local configuration
 - `.env` - Your credentials (create from `.env.example`)
 - `.env.example` - Template for environment variables
 - `whitelist.txt` - Optional file for whitelisted senders
@@ -60,7 +62,33 @@ A safe and intelligent email cleanup tool for iCloud that automatically moves pr
 
 ## Configuration
 
-The script uses a `config.json` file for all settings. If the file doesn't exist, it will be created with default values.
+The script uses a two-tier configuration system:
+
+1. **`config.json`** - Default/shared configuration (Git-tracked)
+2. **`config.local.json`** - Personal overrides (Git-ignored)
+
+### Git-Ready Setup
+
+The default `config.json` contains safe, universal settings:
+- **Conservative defaults** (dry_run: true, age_days: 365)
+- **Basic English keywords** that work for most users
+- **Empty delete_domains** array for you to populate
+- **Standard iCloud settings** that work out of the box
+
+### Personal Configuration Override
+
+For personal settings that you don't want to commit to Git, create a `config.local.json` file:
+
+```powershell
+copy config.local.example.json config.local.json
+# Edit config.local.json with your personal settings
+```
+
+The local config will override any settings from `config.json`. This is perfect for:
+- Personal age thresholds
+- Your specific delete domains
+- Custom keywords for your language/region
+- Enabling/disabling dry run mode
 
 ### Configuration File Structure
 
@@ -78,10 +106,18 @@ The script uses a `config.json` file for all settings. If the file doesn't exist
 ```json
 "cleanup_settings": {
     "age_days": 365,
-    "dry_run": false,
-    "verbose": true
+    "dry_run": true,
+    "verbose": true,
+    "search_timeout": 30,
+    "max_search_keywords": 10
 }
 ```
+
+- `age_days`: Only process emails older than this many days
+- `dry_run`: If true, show what would be moved without actually moving
+- `verbose`: Enable detailed logging
+- `search_timeout`: IMAP search timeout in seconds (prevents hanging)
+- `max_search_keywords`: Batch keywords into groups to improve performance
 
 #### 3. Subject Keywords
 Add or remove keywords that identify emails to be moved:
@@ -129,18 +165,11 @@ Automatically move emails from specific domains (useful for promotional/automate
 
 ### Customization Examples
 
-#### Conservative Settings (1 year, dry run enabled)
-```json
-{
-    "cleanup_settings": {
-        "age_days": 365,
-        "dry_run": true,
-        "verbose": true
-    }
-}
-```
+### Personal Configuration Examples
 
-#### Aggressive Settings (6 months, live mode)
+These examples show what to put in your `config.local.json` file:
+
+#### Enable Live Mode with Aggressive Cleanup
 ```json
 {
     "cleanup_settings": {
@@ -151,25 +180,19 @@ Automatically move emails from specific domains (useful for promotional/automate
 }
 ```
 
-#### Custom Keywords for Dutch Users
+#### Add Dutch Keywords and Specific Domains
 ```json
 {
     "subject_keywords": [
         "unsubscribe", "afmelden", "nieuwsbrief", "newsletter",
         "actie", "korting", "aanbieding", "sale", "promo",
-        "bevestiging", "leveringsupdate", "tracking"
-    ]
-}
-```
-
-#### Delete Specific Domains
-```json
-{
+        "bevestiging", "leveringsupdate", "tracking",
+        "nieuwsbrief", "verzendbericht", "Wat vond u"
+    ],
     "delete_domains": [
         "mail.degiro.com",
         "noreply.booking.com",
-        "updates.linkedin.com",
-        "notifications.paypal.com"
+        "updates.linkedin.com"
     ]
 }
 ```
@@ -210,10 +233,12 @@ Automatically move emails from specific domains (useful for promotional/automate
 ## Important Notes
 
 - The script will create `config.json` with default values if it doesn't exist
+- Use `config.local.json` for personal settings that won't be committed to Git
 - Always test with `"dry_run": true` first to see what would be moved
 - Environment variables `IMAP_USER` and `IMAP_PASS` are still used for login credentials
 - The `whitelist.txt` file is still supported alongside the JSON configuration
 - Moved emails can be easily restored from the review folder if needed
+- Local config overrides take precedence over settings in `config.json`
 
 ## Troubleshooting
 
