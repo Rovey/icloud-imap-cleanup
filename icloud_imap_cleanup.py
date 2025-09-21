@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
 iCloud IMAP cleaner (safe mode): moves noisy/low-value mail to a review folder.
-- Matches newsletters/marketing using List-Unsubscribe header OR subject keywords
-- Only messages older than AGE_DAYS
-- Skips flagged/starred messages
-- Respects a whitelist (emails and/or domains)
-- Works across multiple source folders (e.g., INBOX and Archive)
-- Default is DRY-RUN (no changes). Set DRY_RUN = False to execute.
+
+This refactored version uses a clean class-based architecture following Python standards.
 
 Requirements: Python 3.9+, standard library only.
 Usage:
@@ -24,29 +20,15 @@ import socket
 import threading
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
-from dotenv import load_dotenv
+from typing import Dict, List, Set, Tuple, Optional, Union, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
 
-# Global verbose flag (set by main function)
-_VERBOSE = True
+class ConfigManager:
+    """Handles configuration loading and validation."""
 
-# =========================
-
-def get_optimal_workers(config_value, default_ratio=0.5, min_workers=1, max_workers=20):
-    """Calculate optimal number of workers based on CPU cores"""
-    if isinstance(config_value, int) and config_value > 0:
-        return min(max(config_value, min_workers), max_workers)
-
-    cpu_count = os.cpu_count() or 4  # Fallback to 4 if detection fails
-    optimal = max(int(cpu_count * default_ratio), min_workers)
-    return min(optimal, max_workers)
-
-def load_config():
-    """Load configuration from config.json with fallback to defaults"""
-    default_config = {
+    DEFAULT_CONFIG = {
         "mail_settings": {
             "imap_host": "imap.mail.me.com",
             "imap_port": 993,
@@ -73,7 +55,7 @@ def load_config():
             "Wat vond u"
         ],
         "protect_keywords": [
-            "factuur", "rekening", "nota", "bill", "invoice", 
+            "factuur", "rekening", "nota", "bill", "invoice",
             "belasting", "btw", "tax", "vat", "aanslag",
             "incasso", "aanmaning", "reminder", "overdue",
             "refund", "terugbetaling", "chargeback",
@@ -83,92 +65,110 @@ def load_config():
             "whitelist_file": "whitelist.txt",
             "additional_whitelist": []
         },
-        "delete_domains": [
-            # Example: "mail.degiro.com", "noreply.example.com"
-        ]
+        "delete_domains": []
     }
-    
-    try:
-        with open("config.json", "r", encoding="utf-8") as f:
-            config = json.load(f)
-        
-        # Merge with defaults for any missing keys
-        for section, values in default_config.items():
-            if section not in config:
-                config[section] = values
-            elif isinstance(values, dict):
-                for key, default_value in values.items():
-                    if key not in config[section]:
-                        config[section][key] = default_value
-        
-        # Load local config overrides if they exist
+
+    def __init__(self, config_file: str = "config.json", local_config_file: str = "config.local.json"):
+        self.config_file = config_file
+        self.local_config_file = local_config_file
+        self.config = self._load_config()
+
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration from files with fallback to defaults."""
+        config = self.DEFAULT_CONFIG.copy()
+
         try:
-            with open("config.local.json", "r", encoding="utf-8") as f:
-                local_config = json.load(f)
-            
-            # Merge local config overrides
-            for section, values in local_config.items():
-                if section not in config:
-                    config[section] = values
-                elif isinstance(values, dict) and isinstance(config[section], dict):
-                    config[section].update(values)
-                else:
-                    config[section] = values
-            
-            print("[i] Loaded local configuration overrides from config.local.json")
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                user_config = json.load(f)
+            self._merge_config(config, user_config)
         except FileNotFoundError:
-            pass  # No local config file, that's fine
+            print(f"[!] {self.config_file} not found, using default configuration")
         except json.JSONDecodeError as e:
-            print(f"[!] Error parsing config.local.json: {e}, ignoring local config")
-        
+            print(f"[!] Error parsing {self.config_file}: {e}, using default configuration")
+
+        # Load local overrides
+        try:
+            with open(self.local_config_file, "r", encoding="utf-8") as f:
+                local_config = json.load(f)
+            self._merge_config(config, local_config)
+            print(f"[i] Loaded local configuration overrides from {self.local_config_file}")
+        except FileNotFoundError:
+            pass
+        except json.JSONDecodeError as e:
+            print(f"[!] Error parsing {self.local_config_file}: {e}, ignoring local config")
+
         return config
-    except FileNotFoundError:
-        print("[!] config.json not found, using default configuration")
-        return default_config
-    except json.JSONDecodeError as e:
-        print(f"[!] Error parsing config.json: {e}, using default configuration")
-        return default_config
 
-def load_whitelist(config):
-    whitelist_file = config["whitelist_settings"]["whitelist_file"]
-    additional_whitelist = set(config["whitelist_settings"]["additional_whitelist"])
-    
-    items = set(w.strip().lower() for w in additional_whitelist if w.strip())
-    try:
-        with open(whitelist_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    items.add(line.lower())
-    except FileNotFoundError:
-        pass
-    return items
+    def _merge_config(self, base: Dict[str, Any], override: Dict[str, Any]) -> None:
+        """Recursively merge configuration dictionaries."""
+        for section, values in override.items():
+            if section not in base:
+                base[section] = values
+            elif isinstance(values, dict) and isinstance(base[section], dict):
+                self._merge_config(base[section], values)
+            else:
+                base[section] = values
 
-def connect(imap_host, imap_port, username, password):
-    # Set socket timeout to prevent hanging
-    socket.setdefaulttimeout(30)
-    m = imaplib.IMAP4_SSL(imap_host, imap_port)
-    m.login(username, password)
-    return m
+    def get_optimal_workers(self, config_value: Union[str, int],
+                           default_ratio: float = 0.5,
+                           min_workers: int = 1,
+                           max_workers: int = 20) -> int:
+        """Calculate optimal number of workers based on CPU cores."""
+        if isinstance(config_value, int) and config_value > 0:
+            return min(max(config_value, min_workers), max_workers)
+
+        cpu_count = os.cpu_count() or 4
+        optimal = max(int(cpu_count * default_ratio), min_workers)
+        return min(optimal, max_workers)
+
+    def load_whitelist(self) -> Set[str]:
+        """Load whitelist from file and additional entries."""
+        whitelist_file = self.config["whitelist_settings"]["whitelist_file"]
+        additional_whitelist = set(self.config["whitelist_settings"]["additional_whitelist"])
+
+        items = set(w.strip().lower() for w in additional_whitelist if w.strip())
+
+        try:
+            with open(whitelist_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        items.add(line.lower())
+        except FileNotFoundError:
+            pass
+
+        return items
+
 
 class IMAPConnectionPool:
-    def __init__(self, imap_host, imap_port, username, password, max_connections=5):
-        self.imap_host = imap_host
-        self.imap_port = imap_port
+    """Thread-safe IMAP connection pool."""
+
+    def __init__(self, host: str, port: int, username: str, password: str, max_connections: int = 5):
+        self.host = host
+        self.port = port
         self.username = username
         self.password = password
         self.max_connections = max_connections
-        self._pool = []
+        self._pool: List[imaplib.IMAP4_SSL] = []
         self._lock = threading.Lock()
 
-    def get_connection(self):
+    def _create_connection(self) -> imaplib.IMAP4_SSL:
+        """Create a new IMAP connection."""
+        socket.setdefaulttimeout(30)
+        conn = imaplib.IMAP4_SSL(self.host, self.port)
+        conn.login(self.username, self.password)
+        return conn
+
+    def get_connection(self) -> imaplib.IMAP4_SSL:
+        """Get a connection from the pool or create a new one."""
         with self._lock:
             if self._pool:
                 return self._pool.pop()
             else:
-                return connect(self.imap_host, self.imap_port, self.username, self.password)
+                return self._create_connection()
 
-    def return_connection(self, conn):
+    def return_connection(self, conn: imaplib.IMAP4_SSL) -> None:
+        """Return a connection to the pool."""
         with self._lock:
             if len(self._pool) < self.max_connections:
                 self._pool.append(conn)
@@ -178,7 +178,8 @@ class IMAPConnectionPool:
                 except:
                     pass
 
-    def close_all(self):
+    def close_all(self) -> None:
+        """Close all pooled connections."""
         with self._lock:
             for conn in self._pool:
                 try:
@@ -187,290 +188,308 @@ class IMAPConnectionPool:
                     pass
             self._pool.clear()
 
-def ensure_folder(m, mailbox):
-    typ, data = m.list()
-    if typ != "OK":
-        return
-    existing = [line.decode().split(' "/" ')[-1].strip('"') for line in data if line]
-    if mailbox not in existing:
-        m.create(mailbox)
 
-def imap_date_before(days):
-    dt = datetime.now(timezone.utc) - timedelta(days=days)
-    return dt.strftime("%d-%b-%Y")  # e.g., 17-Sep-2025
+class IMAPManager:
+    """Manages IMAP operations and queries."""
 
-def search_uids(m, folder, query_parts, max_retries=2):
-    m.select(folder, readonly=True)
-    
-    for attempt in range(max_retries + 1):
-        try:
-            # Try the search with proper IMAP syntax
-            if isinstance(query_parts, list):
-                # Convert list to proper IMAP search string
-                query_string = " ".join(str(part) for part in query_parts)
-            else:
-                query_string = query_parts
-            
-            if _VERBOSE and attempt > 0:
-                print(f"[i] Retrying search (attempt {attempt + 1})")
-            
-            typ, data = m.uid("SEARCH", None, query_string)
-            if typ != "OK" or not data or data[0] is None:
-                return set()
-            uids = set(data[0].decode().split())
-            return uids
-            
-        except (socket.timeout, socket.error) as e:
-            if _VERBOSE:
-                print(f"[!] Network timeout/error on search attempt {attempt + 1}: {e}")
-            if attempt < max_retries:
-                continue
-            else:
-                print(f"[!] Search failed after {max_retries + 1} attempts, skipping")
-                return set()
-        except Exception as e:
-            if _VERBOSE:
-                print(f"[!] Search error: {e}")
-            return set()
-    
-    return set()
+    def __init__(self, pool: IMAPConnectionPool, verbose: bool = True):
+        self.pool = pool
+        self.verbose = verbose
 
-def union_searches(m, folder, queries):
-    u = set()
-    for i, q in enumerate(queries):
-        if _VERBOSE and len(queries) > 5:
-            print(f"[i] Processing search query {i + 1}/{len(queries)}")
-        u |= search_uids(m, folder, q)
-    return u
+    def ensure_folder(self, conn: imaplib.IMAP4_SSL, mailbox: str) -> None:
+        """Ensure a folder exists, create if necessary."""
+        typ, data = conn.list()
+        if typ != "OK":
+            return
+        existing = [line.decode().split(' "/" ')[-1].strip('"') for line in data if line]
+        if mailbox not in existing:
+            conn.create(mailbox)
 
-def fetch_headers(m, uid, fields="(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])"):
-    typ, msg_data = m.uid("FETCH", uid, fields)
-    if typ != "OK" or not msg_data or msg_data[0] is None:
-        return None, None
-    raw = msg_data[0][1]
-    msg = email.message_from_bytes(raw)
-    subj = str(make_header(decode_header(msg.get("Subject", "")))).strip()
-    from_raw = msg.get("From", "")
-    return from_raw, subj
-
-def fetch_headers_batch(pool, folder, uids):
-    """Fetch headers for multiple UIDs using a connection from the pool"""
-    conn = pool.get_connection()
-    results = {}
-
-    try:
+    def search_uids(self, conn: imaplib.IMAP4_SSL, folder: str, query: str, max_retries: int = 2) -> Set[str]:
+        """Search for UIDs matching the query."""
         conn.select(folder, readonly=True)
-        for uid in uids:
+
+        for attempt in range(max_retries + 1):
             try:
-                from_raw, subject = fetch_headers(conn, uid)
-                results[uid] = (from_raw, subject)
+                if self.verbose and attempt > 0:
+                    print(f"[i] Retrying search (attempt {attempt + 1})")
+
+                typ, data = conn.uid("SEARCH", None, query)
+                if typ != "OK" or not data or data[0] is None:
+                    return set()
+
+                return set(data[0].decode().split())
+
+            except (socket.timeout, socket.error) as e:
+                if self.verbose:
+                    print(f"[!] Network timeout/error on search attempt {attempt + 1}: {e}")
+                if attempt < max_retries:
+                    continue
+                else:
+                    print(f"[!] Search failed after {max_retries + 1} attempts, skipping")
+                    return set()
             except Exception as e:
-                if _VERBOSE:
-                    print(f"[!] Error fetching headers for UID {uid}: {e}")
-                results[uid] = (None, None)
-    finally:
-        pool.return_connection(conn)
+                if self.verbose:
+                    print(f"[!] Search error: {e}")
+                return set()
 
-    return results
+        return set()
 
-def parse_from_address(from_header):
-    # crude but good-enough extraction of the email address
-    addr = email.utils.parseaddr(from_header)[1].lower()
-    domain = addr.split("@")[-1] if "@" in addr else ""
-    return addr, domain
+    def union_searches(self, conn: imaplib.IMAP4_SSL, folder: str, queries: List[str]) -> Set[str]:
+        """Perform multiple searches and return union of results."""
+        result = set()
+        for i, query in enumerate(queries):
+            if self.verbose and len(queries) > 5:
+                print(f"[i] Processing search query {i + 1}/{len(queries)}")
+            result |= self.search_uids(conn, folder, query)
+        return result
 
-def uid_move(m, uid, dest):
-    # Try UID MOVE (RFC 6851). If unsupported, fallback to COPY+DELETE.
-    typ, _ = m.uid("MOVE", uid, dest)
-    if typ == "OK":
-        return True
-    # Fallback
-    typ, _ = m.uid("COPY", uid, dest)
-    if typ != "OK":
-        return False
-    m.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
-    m.expunge()
-    return True
+    def fetch_headers(self, conn: imaplib.IMAP4_SSL, uid: str) -> Tuple[Optional[str], Optional[str]]:
+        """Fetch email headers for a specific UID."""
+        try:
+            typ, msg_data = conn.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+            if typ != "OK" or not msg_data or msg_data[0] is None:
+                return None, None
 
-def process_email_decision(uid, from_raw, subject, wl, protect_keywords, subject_keywords,
-                          delete_domains, set_a, set_b, set_c):
-    """Make decision about an email without I/O operations"""
-    if from_raw is None:
-        return None
+            raw = msg_data[0][1]
+            msg = email.message_from_bytes(raw)
+            subject = str(make_header(decode_header(msg.get("Subject", "")))).strip()
+            from_raw = msg.get("From", "")
+            return from_raw, subject
+        except Exception as e:
+            if self.verbose:
+                print(f"[!] Error fetching headers for UID {uid}: {e}")
+            return None, None
 
-    addr, domain = parse_from_address(from_raw)
+    def fetch_headers_batch(self, folder: str, uids: List[str]) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+        """Fetch headers for multiple UIDs using a connection from the pool."""
+        conn = self.pool.get_connection()
+        results = {}
 
-    # Whitelist check
-    if addr in wl or domain in wl:
-        return ("skip", "whitelist", addr, subject)
+        try:
+            conn.select(folder, readonly=True)
+            for uid in uids:
+                results[uid] = self.fetch_headers(conn, uid)
+        finally:
+            self.pool.return_connection(conn)
 
-    # Protect keywords (never move)
-    subj_l = (subject or "").lower()
-    if any(pk in subj_l for pk in protect_keywords):
-        return ("skip", "protected subject", addr, subject)
-
-    # Determine why this email was selected
-    match_reason = "unknown"
-    if uid in set_a:
-        match_reason = "List-Unsubscribe header"
-    elif uid in set_b:
-        # Find which keyword matched
-        for kw in subject_keywords:
-            if kw.lower() in subj_l:
-                match_reason = f"subject keyword '{kw}'"
-                break
-        if match_reason == "unknown":
-            match_reason = "subject keyword"
-    elif uid in set_c:
-        # Find which domain matched
-        for del_domain in delete_domains:
-            if domain == del_domain or addr.endswith(f"@{del_domain}"):
-                match_reason = f"delete domain '{del_domain}'"
-                break
-        if match_reason == "unknown":
-            match_reason = "delete domain"
-
-    return ("process", match_reason, addr, subject)
-
-def execute_email_actions(pool, folder, actions, target_folder, dry_run, verbose):
-    """Execute the actual email moves/deletions"""
-    results = []
-    if not actions:
         return results
 
-    conn = pool.get_connection()
-    try:
-        if not dry_run:
-            conn.select(folder)  # Need write access for moves
-
-        for uid, match_reason, addr, subject in actions:
-            if dry_run:
-                results.append(f"  - DRY-RUN would move UID {uid} from {folder} → {target_folder} | {addr} | {match_reason} | {subject}")
-                results.append(("candidate", uid, addr, subject, match_reason))
-            else:
-                try:
-                    ok = uid_move(conn, uid, target_folder)
-                    if ok:
-                        results.append(("moved", uid, addr, subject, match_reason))
-                        if verbose:
-                            results.append(f"  - Moved UID {uid} to {target_folder} | {match_reason}")
-                    else:
-                        results.append(f"  - FAILED to move UID {uid}")
-                except Exception as e:
-                    results.append(f"  - Error moving UID {uid}: {e}")
-
-    finally:
-        pool.return_connection(conn)
-
-    return results
-
-def main():
-    global _VERBOSE
-    
-    # Load configuration
-    config = load_config()
-    
-    # Extract configuration values
-    imap_host = config["mail_settings"]["imap_host"]
-    imap_port = config["mail_settings"]["imap_port"]
-    username = os.getenv("IMAP_USER", "YOUR_ICLOUD_EMAIL@icloud.com")
-    password = os.getenv("IMAP_PASS", "APP_SPECIFIC_PASSWORD")
-    
-    source_folders = config["mail_settings"]["source_folders"]
-    target_folder = config["mail_settings"]["target_folder"]
-    
-    age_days = config["cleanup_settings"]["age_days"]
-    dry_run = config["cleanup_settings"]["dry_run"]
-    verbose = config["cleanup_settings"]["verbose"]
-    search_timeout = config["cleanup_settings"].get("search_timeout", 30)
-    max_search_keywords = config["cleanup_settings"].get("max_search_keywords", 10)
-    max_workers = get_optimal_workers(config["cleanup_settings"].get("max_workers", "auto"))
-    header_fetch_workers = get_optimal_workers(config["cleanup_settings"].get("header_fetch_workers", "auto"))
-    batch_size = config["cleanup_settings"].get("batch_size", 50)
-    
-    # Set socket timeout
-    socket.setdefaulttimeout(search_timeout)
-    
-    # Set global verbose flag
-    _VERBOSE = verbose
-    
-    subject_keywords = config["subject_keywords"]
-    protect_keywords = config["protect_keywords"]
-    delete_domains = config.get("delete_domains", [])
-    
-    wl = load_whitelist(config)
-    if verbose:
-        print(f"[i] Loaded {len(wl)} whitelist entries")
-
-    # Create connection pools for threading
-    pool = IMAPConnectionPool(imap_host, imap_port, username, password, max_workers + header_fetch_workers)
-
-    # Create main connection for searches and folder operations
-    m = connect(imap_host, imap_port, username, password)
-    if verbose:
-        cores = os.cpu_count() or 4
-        print(f"[i] Logged in to iCloud IMAP")
-        print(f"[i] System cores: {cores}, Using {max_workers} processing workers + {header_fetch_workers} header fetch workers")
-
-    ensure_folder(m, target_folder)
-
-    before = imap_date_before(age_days)
-    if verbose:
-        print(f"[i] Only touching messages BEFORE {before} (>{age_days} days old)")
-
-    # Build searches:
-    # A) Messages with List-Unsubscribe header (unflagged and older than age_days)
-    q_list_unsub = f'NOT FLAGGED BEFORE {before} HEADER List-Unsubscribe ""'
-    
-    # B) Subject contains any keyword (batch them to avoid too many searches)
-    if len(subject_keywords) > max_search_keywords:
-        if verbose:
-            print(f"[i] Batching {len(subject_keywords)} keywords into groups of {max_search_keywords}")
-        subject_batches = [subject_keywords[i:i + max_search_keywords] 
-                          for i in range(0, len(subject_keywords), max_search_keywords)]
-        subject_queries = []
-        for batch in subject_batches:
-            # Create OR query for batch
-            or_terms = " OR ".join([f'SUBJECT "{kw}"' for kw in batch])
-            subject_queries.append(f'NOT FLAGGED BEFORE {before} ({or_terms})')
-    else:
-        subject_queries = [f'NOT FLAGGED BEFORE {before} SUBJECT "{kw}"' for kw in subject_keywords]
-    
-    # C) Domain-based deletion queries (from specific domains)
-    domain_queries = [f'NOT FLAGGED BEFORE {before} FROM "{domain}"' for domain in delete_domains]
-
-    total_candidates = 0
-    total_moved = 0
-
-    for folder in source_folders:
+    def move_email(self, conn: imaplib.IMAP4_SSL, uid: str, dest_folder: str) -> bool:
+        """Move an email to the destination folder."""
         try:
-            m.select(folder, readonly=True)
+            # Try UID MOVE (RFC 6851). If unsupported, fallback to COPY+DELETE.
+            typ, _ = conn.uid("MOVE", uid, dest_folder)
+            if typ == "OK":
+                return True
+
+            # Fallback
+            typ, _ = conn.uid("COPY", uid, dest_folder)
+            if typ != "OK":
+                return False
+
+            conn.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
+            conn.expunge()
+            return True
+        except Exception:
+            return False
+
+
+class EmailAnalyzer:
+    """Analyzes emails and makes processing decisions."""
+
+    def __init__(self, whitelist: Set[str], protect_keywords: List[str],
+                 subject_keywords: List[str], delete_domains: List[str]):
+        self.whitelist = whitelist
+        self.protect_keywords = protect_keywords
+        self.subject_keywords = subject_keywords
+        self.delete_domains = delete_domains
+
+    def parse_from_address(self, from_header: str) -> Tuple[str, str]:
+        """Extract email address and domain from From header."""
+        addr = email.utils.parseaddr(from_header)[1].lower()
+        domain = addr.split("@")[-1] if "@" in addr else ""
+        return addr, domain
+
+    def should_process_email(self, uid: str, from_raw: Optional[str], subject: Optional[str],
+                           set_a: Set[str], set_b: Set[str], set_c: Set[str]) -> Optional[Tuple[str, str, str, str]]:
+        """Determine if an email should be processed and why."""
+        if from_raw is None:
+            return None
+
+        addr, domain = self.parse_from_address(from_raw)
+
+        # Whitelist check
+        if addr in self.whitelist or domain in self.whitelist:
+            return ("skip", "whitelist", addr, subject or "")
+
+        # Protect keywords (never move)
+        subj_lower = (subject or "").lower()
+        if any(pk in subj_lower for pk in self.protect_keywords):
+            return ("skip", "protected subject", addr, subject or "")
+
+        # Determine match reason
+        match_reason = "unknown"
+        if uid in set_a:
+            match_reason = "List-Unsubscribe header"
+        elif uid in set_b:
+            # Find which keyword matched
+            for kw in self.subject_keywords:
+                if kw.lower() in subj_lower:
+                    match_reason = f"subject keyword '{kw}'"
+                    break
+            if match_reason == "unknown":
+                match_reason = "subject keyword"
+        elif uid in set_c:
+            # Find which domain matched
+            for del_domain in self.delete_domains:
+                if domain == del_domain or addr.endswith(f"@{del_domain}"):
+                    match_reason = f"delete domain '{del_domain}'"
+                    break
+            if match_reason == "unknown":
+                match_reason = "delete domain"
+
+        return ("process", match_reason, addr, subject or "")
+
+
+class EmailProcessor:
+    """Main email processing orchestrator."""
+
+    def __init__(self, config_manager: ConfigManager):
+        self.config = config_manager.config
+        self.config_manager = config_manager
+        self.verbose = self.config["cleanup_settings"]["verbose"]
+
+        # Initialize components
+        self._setup_credentials()
+        self._setup_workers()
+        self._setup_components()
+
+    def _setup_credentials(self) -> None:
+        """Setup IMAP credentials from environment or config."""
+        load_dotenv()
+        self.username = os.getenv("IMAP_USER", "YOUR_ICLOUD_EMAIL@icloud.com")
+        self.password = os.getenv("IMAP_PASS", "APP_SPECIFIC_PASSWORD")
+
+    def _setup_workers(self) -> None:
+        """Setup worker thread counts."""
+        self.max_workers = self.config_manager.get_optimal_workers(
+            self.config["cleanup_settings"]["max_workers"]
+        )
+        self.header_fetch_workers = self.config_manager.get_optimal_workers(
+            self.config["cleanup_settings"]["header_fetch_workers"]
+        )
+        self.batch_size = self.config["cleanup_settings"]["batch_size"]
+
+    def _setup_components(self) -> None:
+        """Initialize processing components."""
+        # Connection pool
+        total_connections = self.max_workers + self.header_fetch_workers
+        self.pool = IMAPConnectionPool(
+            self.config["mail_settings"]["imap_host"],
+            self.config["mail_settings"]["imap_port"],
+            self.username,
+            self.password,
+            total_connections
+        )
+
+        # IMAP manager
+        self.imap_manager = IMAPManager(self.pool, self.verbose)
+
+        # Email analyzer
+        whitelist = self.config_manager.load_whitelist()
+        self.analyzer = EmailAnalyzer(
+            whitelist,
+            self.config["protect_keywords"],
+            self.config["subject_keywords"],
+            self.config["delete_domains"]
+        )
+
+        # Set socket timeout
+        socket.setdefaulttimeout(self.config["cleanup_settings"]["search_timeout"])
+
+    def _get_search_date(self) -> str:
+        """Get IMAP date string for age filtering."""
+        age_days = self.config["cleanup_settings"]["age_days"]
+        dt = datetime.now(timezone.utc) - timedelta(days=age_days)
+        return dt.strftime("%d-%b-%Y")
+
+    def _build_search_queries(self, before_date: str) -> Tuple[str, List[str], List[str]]:
+        """Build IMAP search queries."""
+        # A) Messages with List-Unsubscribe header
+        list_unsub_query = f'NOT FLAGGED BEFORE {before_date} HEADER List-Unsubscribe ""'
+
+        # B) Subject keyword queries
+        subject_keywords = self.config["subject_keywords"]
+        max_keywords = self.config["cleanup_settings"]["max_search_keywords"]
+
+        if len(subject_keywords) > max_keywords:
+            if self.verbose:
+                print(f"[i] Batching {len(subject_keywords)} keywords into groups of {max_keywords}")
+
+            subject_batches = [subject_keywords[i:i + max_keywords]
+                             for i in range(0, len(subject_keywords), max_keywords)]
+            subject_queries = []
+            for batch in subject_batches:
+                or_terms = " OR ".join([f'SUBJECT "{kw}"' for kw in batch])
+                subject_queries.append(f'NOT FLAGGED BEFORE {before_date} ({or_terms})')
+        else:
+            subject_queries = [f'NOT FLAGGED BEFORE {before_date} SUBJECT "{kw}"'
+                             for kw in subject_keywords]
+
+        # C) Domain deletion queries
+        domain_queries = [f'NOT FLAGGED BEFORE {before_date} FROM "{domain}"'
+                         for domain in self.config["delete_domains"]]
+
+        return list_unsub_query, subject_queries, domain_queries
+
+    def process_folder(self, folder: str, main_conn: imaplib.IMAP4_SSL) -> Tuple[int, int]:
+        """Process a single folder and return (candidates, moved) counts."""
+        if self.verbose:
+            print(f"\n[i] Processing folder: {folder}")
+
+        try:
+            main_conn.select(folder, readonly=True)
         except Exception as e:
             print(f"[!] Could not select folder {folder}: {e}")
-            continue
+            return 0, 0
 
-        set_a = search_uids(m, folder, q_list_unsub)
-        set_b = union_searches(m, folder, subject_queries)
-        set_c = union_searches(m, folder, domain_queries)
+        # Build and execute searches
+        before_date = self._get_search_date()
+        list_unsub_query, subject_queries, domain_queries = self._build_search_queries(before_date)
+
+        set_a = self.imap_manager.search_uids(main_conn, folder, list_unsub_query)
+        set_b = self.imap_manager.union_searches(main_conn, folder, subject_queries)
+        set_c = self.imap_manager.union_searches(main_conn, folder, domain_queries)
+
         candidates = list(set_a | set_b | set_c)
 
-        if verbose:
+        if self.verbose:
             print(f"[i] {folder}: {len(candidates)} candidate messages")
 
         if not candidates:
-            continue
+            return 0, 0
 
-        if verbose:
-            print(f"[i] Step 1: Fetching headers for {len(candidates)} emails using {header_fetch_workers} threads")
+        return self._process_candidates(folder, candidates, set_a, set_b, set_c)
 
-        # Step 1: Fetch all headers in parallel
-        header_batches = [candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)]
+    def _process_candidates(self, folder: str, candidates: List[str],
+                          set_a: Set[str], set_b: Set[str], set_c: Set[str]) -> Tuple[int, int]:
+        """Process candidate emails through the 3-phase pipeline."""
+        total_candidates = 0
+        total_moved = 0
+
+        # Phase 1: Fetch headers in parallel
+        if self.verbose:
+            print(f"[i] Step 1: Fetching headers for {len(candidates)} emails using {self.header_fetch_workers} threads")
+
+        header_batches = [candidates[i:i + self.batch_size]
+                         for i in range(0, len(candidates), self.batch_size)]
         all_headers = {}
 
-        with ThreadPoolExecutor(max_workers=header_fetch_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.header_fetch_workers) as executor:
             header_futures = []
             for batch in header_batches:
-                future = executor.submit(fetch_headers_batch, pool, folder, batch)
+                future = executor.submit(self.imap_manager.fetch_headers_batch, folder, batch)
                 header_futures.append(future)
 
             for future in as_completed(header_futures):
@@ -478,24 +497,21 @@ def main():
                     batch_headers = future.result()
                     all_headers.update(batch_headers)
                 except Exception as e:
-                    if verbose:
+                    if self.verbose:
                         print(f"[!] Header fetch error: {e}")
 
-        if verbose:
+        # Phase 2: Process decisions in parallel
+        if self.verbose:
             print(f"[i] Step 2: Processing decisions for {len(all_headers)} emails")
 
-        # Step 2: Process all decisions in parallel (CPU-bound, no I/O)
-        decisions = {}
         actions_to_execute = []
 
-        # Process decisions in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             decision_futures = {}
             for uid, (from_raw, subject) in all_headers.items():
                 future = executor.submit(
-                    process_email_decision,
-                    uid, from_raw, subject, wl, protect_keywords, subject_keywords,
-                    delete_domains, set_a, set_b, set_c
+                    self.analyzer.should_process_email,
+                    uid, from_raw, subject, set_a, set_b, set_c
                 )
                 decision_futures[future] = uid
 
@@ -504,59 +520,137 @@ def main():
                 try:
                     decision = future.result()
                     if decision:
-                        decisions[uid] = decision
                         action, reason, addr, subject = decision
                         if action == "process":
                             actions_to_execute.append((uid, reason, addr, subject))
                             total_candidates += 1
-                        elif action == "skip" and verbose:
+                        elif action == "skip" and self.verbose:
                             print(f"  - SKIP ({reason}): {addr} | {subject}")
                 except Exception as e:
-                    if verbose:
+                    if self.verbose:
                         print(f"[!] Decision processing error for UID {uid}: {e}")
 
-        if verbose and actions_to_execute:
-            print(f"[i] Step 3: Executing actions for {len(actions_to_execute)} emails using {max_workers} threads")
-
-        # Step 3: Execute actions in parallel
+        # Phase 3: Execute actions in parallel
         if actions_to_execute:
-            action_batches = [actions_to_execute[i:i + batch_size] for i in range(0, len(actions_to_execute), batch_size)]
+            if self.verbose:
+                print(f"[i] Step 3: Executing actions for {len(actions_to_execute)} emails using {self.max_workers} threads")
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                action_futures = []
-                for batch in action_batches:
-                    future = executor.submit(
-                        execute_email_actions,
-                        pool, folder, batch, target_folder, dry_run, verbose
-                    )
-                    action_futures.append(future)
+            total_moved = self._execute_actions(folder, actions_to_execute)
 
-                for future in as_completed(action_futures):
+        return total_candidates, total_moved
+
+    def _execute_actions(self, folder: str, actions: List[Tuple[str, str, str, str]]) -> int:
+        """Execute email actions in parallel."""
+        target_folder = self.config["mail_settings"]["target_folder"]
+        dry_run = self.config["cleanup_settings"]["dry_run"]
+        total_moved = 0
+
+        action_batches = [actions[i:i + self.batch_size]
+                         for i in range(0, len(actions), self.batch_size)]
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            action_futures = []
+            for batch in action_batches:
+                future = executor.submit(self._execute_action_batch, folder, batch, target_folder, dry_run)
+                action_futures.append(future)
+
+            for future in as_completed(action_futures):
+                try:
+                    moved_count = future.result()
+                    total_moved += moved_count
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[!] Action execution error: {e}")
+
+        return total_moved
+
+    def _execute_action_batch(self, folder: str, actions: List[Tuple[str, str, str, str]],
+                             target_folder: str, dry_run: bool) -> int:
+        """Execute a batch of actions."""
+        moved_count = 0
+        conn = self.pool.get_connection()
+
+        try:
+            if not dry_run:
+                conn.select(folder)  # Need write access for moves
+
+            for uid, match_reason, addr, subject in actions:
+                if dry_run:
+                    if self.verbose:
+                        print(f"  - DRY-RUN would move UID {uid} from {folder} → {target_folder} | {addr} | {match_reason} | {subject}")
+                else:
                     try:
-                        batch_results = future.result()
-                        for result in batch_results:
-                            if isinstance(result, tuple):
-                                action, uid, addr, subject, match_reason = result
-                                if action == "moved":
-                                    total_moved += 1
-                            elif isinstance(result, str) and verbose:
-                                print(result)
+                        if self.imap_manager.move_email(conn, uid, target_folder):
+                            moved_count += 1
+                            if self.verbose:
+                                print(f"  - Moved UID {uid} to {target_folder} | {match_reason}")
+                        else:
+                            if self.verbose:
+                                print(f"  - FAILED to move UID {uid}")
                     except Exception as e:
-                        if verbose:
-                            print(f"[!] Action execution error: {e}")
+                        if self.verbose:
+                            print(f"  - Error moving UID {uid}: {e}")
 
-    # Cleanup connections
+        finally:
+            self.pool.return_connection(conn)
+
+        return moved_count
+
+    def run(self) -> None:
+        """Run the complete email cleanup process."""
+        if self.verbose:
+            cores = os.cpu_count() or 4
+            print(f"[i] System cores: {cores}, Using {self.max_workers} processing workers + {self.header_fetch_workers} header fetch workers")
+
+        # Create main connection
+        main_conn = self.pool.get_connection()
+
+        try:
+            if self.verbose:
+                print("[i] Logged in to iCloud IMAP")
+
+            # Ensure target folder exists
+            target_folder = self.config["mail_settings"]["target_folder"]
+            self.imap_manager.ensure_folder(main_conn, target_folder)
+
+            before_date = self._get_search_date()
+            age_days = self.config["cleanup_settings"]["age_days"]
+            if self.verbose:
+                print(f"[i] Only touching messages BEFORE {before_date} (>{age_days} days old)")
+
+            # Process all folders
+            total_candidates = 0
+            total_moved = 0
+
+            for folder in self.config["mail_settings"]["source_folders"]:
+                candidates, moved = self.process_folder(folder, main_conn)
+                total_candidates += candidates
+                total_moved += moved
+
+            # Summary
+            print(f"\n[done] Candidates considered: {total_candidates}")
+            if not self.config["cleanup_settings"]["dry_run"]:
+                print(f"[done] Actually moved:      {total_moved}")
+            else:
+                print("[note] DRY-RUN enabled — no changes were made. Set dry_run=false in config.json to execute.")
+
+        finally:
+            self.pool.return_connection(main_conn)
+            self.pool.close_all()
+
+
+def main():
+    """Main entry point."""
     try:
-        m.logout()
-    except:
-        pass
-    pool.close_all()
+        config_manager = ConfigManager()
+        processor = EmailProcessor(config_manager)
+        processor.run()
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user")
+    except Exception as e:
+        print(f"[!] Unexpected error: {e}")
+        raise
 
-    print(f"[done] Candidates considered: {total_candidates}")
-    if not dry_run:
-        print(f"[done] Actually moved:      {total_moved}")
-    else:
-        print("[note] DRY-RUN enabled — no changes were made. Set dry_run=false in config.json to execute.")
 
 if __name__ == "__main__":
     main()
