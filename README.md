@@ -26,25 +26,37 @@ A safe and intelligent email cleanup tool for iCloud that automatically moves pr
    - Generate an app-specific password for this script
 
 2. **Set Environment Variables**
-   ```bash
-   # Create .env file or set environment variables
-   IMAP_USER=your_icloud_email@icloud.com
-   IMAP_PASS=your_app_specific_password
+   ```powershell
+   # Copy the example file and edit with your credentials
+   copy .env.example .env
+   
+   # Then edit .env file with your actual credentials:
+   # IMAP_USER=your_icloud_email@icloud.com
+   # IMAP_PASS=your_app_specific_password
    ```
 
 3. **Install Dependencies**
-   ```bash
+   ```powershell
    pip install python-dotenv
    ```
 
 4. **Run in Test Mode**
-   ```bash
+   ```powershell
    python icloud_imap_cleanup.py
    ```
    The script runs in dry-run mode by default, showing what would be moved.
 
 5. **Enable Live Mode**
    Edit `config.json` and set `"dry_run": false` to actually move emails.
+
+## Project Files
+
+- `icloud_imap_cleanup.py` - Main script
+- `config.json` - Configuration file (auto-created with defaults)
+- `.env` - Your credentials (create from `.env.example`)
+- `.env.example` - Template for environment variables
+- `whitelist.txt` - Optional file for whitelisted senders
+- `README.md` - This documentation
 
 ## Configuration
 
